@@ -19,7 +19,7 @@ IAllocator create_sys_alloc(void *memory, size_t memory_size) {
   return (IAllocator) {
     .alloc = sys_alloc_impl, .realloc = sys_realloc_impl, .free = sys_free_impl,
     .reset = stub_reset, .ctx = NULL
-  }
+  };
 }
 void sys_free_impl(IAllocator *self, void *ptr) {
   UNUSED(self);
