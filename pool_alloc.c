@@ -22,30 +22,29 @@ void pool_free_impl(IAllocator *self, void *ptr) {
 }
 
 void *pool_alloc_impl(IAllocator *self, size_t size) {
-  UNUSED(size); // Пул выдает блоки фиксированного размера
   PoolCtx *ctx = (PoolCtx *)self->ctx;
-
   if (!ctx->free_list)
     return NULL;
-
   Node *node = ctx->free_list;
   ctx->free_list = node->next;
-
   return node;
 }
 
 IAllocator create_pool_alloc(PoolCtx *ctx, void *memory, size_t memory_size,
                              size_t block_size) {
+
+  if (block_size<sizeof(Node)){
+    block_size=sizeof(Node);
+  }
+
   ctx->buffer = memory;
   ctx->block_size = block_size;
   ctx->free_list = NULL;
 
-  // Инициализация списка свободных блоков
   size_t block_count = memory_size / block_size;
-  char *mem_ptr = (char *)memory;
 
   for (size_t i = 0; i < block_count; ++i) {
-    Node *node = (Node *)(mem_ptr + i * block_size);
+    Node *node = (Node *)(memory + i * block_size);
     node->next = ctx->free_list;
     ctx->free_list = node;
   }
