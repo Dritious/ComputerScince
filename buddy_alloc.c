@@ -1,177 +1,185 @@
 #include "allocator.c"
 #include "allocator.h"
-#include <assert.h>
 #include <stdalign.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
-#define MAX_ORDERS 32
-#define MIN_ORDER 5 // Минимальный блок 32 байта (заголовок + выравнивание)
+#define MIN_ORDER 5
+#define MAX_ORDER 32
+#define MIN_BLOCK (1ULL << MIN_ORDER)
 
-typedef struct BlockHeader {
+typedef struct BuddyBlock {
   uint8_t order;
-  bool is_free;
-  struct BlockHeader *next_free;
-} BlockHeader;
+  uint8_t is_free;
+  struct BuddyBlock *next;
+} BuddyBlock;
 
-typedef struct {
-  void *buffer;      // Выровненная база buddy-региона
-  size_t total_size; // Размер buddy-региона, кратный степени двойки
+typedef struct BuddyCtx {
+  void *base;
+  size_t size;
   uint8_t max_order;
-  BlockHeader *free_lists[MAX_ORDERS];
+  BuddyBlock *free_lists[MAX_ORDER];
 } BuddyCtx;
 
-// Округление вверх до выравнивания
-static void *align_up_ptr(void *ptr, size_t alignment) {
-  uintptr_t p = (uintptr_t)ptr;
-  uintptr_t aligned = (p + alignment - 1) & ~(uintptr_t)(alignment - 1);
-  return (void *)aligned;
-}
+static size_t block_size(uint8_t order) { return 1ULL << order; }
 
-// Размер блока по порядку
-static size_t get_block_size(uint8_t order) { return (1ULL << order); }
+static BuddyBlock *user_to_block(BuddyCtx *ctx, void *ptr) {
+  if (!ctx || !ctx->base || !ptr)
+    return NULL;
 
-// для allocation (ceil)
-static uint8_t get_order(size_t size) {
-  uint8_t order = MIN_ORDER;
-  while (order < MAX_ORDERS - 1 && (1ULL << order) < size) {
-    order++;
+  uintptr_t base = (uintptr_t)ctx->base;
+  uintptr_t user = (uintptr_t)ptr;
+
+  if (user < base + sizeof(BuddyBlock) || user >= base + ctx->size) {
+    return NULL;
   }
-  return order;
+
+  return (BuddyBlock *)(user - sizeof(BuddyBlock));
 }
 
-// для max_order (floor)
-static uint8_t get_max_order(size_t size) {
-  uint8_t order = MIN_ORDER;
-  while (order < MAX_ORDERS - 1 && (1ULL << (order + 1)) <= size) {
-    order++;
-  }
-  return order;
-}
-
-// Удаление конкретного узла из списка свободных (нужно при слиянии)
-static void remove_from_list(BuddyCtx *ctx, BlockHeader *node, uint8_t order) {
-  BlockHeader **curr = &ctx->free_lists[order];
-  while (*curr) {
-    if (*curr == node) {
-      *curr = node->next_free;
-      node->next_free = NULL;
-      return;
+static int remove_from_free_list(BuddyCtx *ctx, BuddyBlock *block,
+                                 uint8_t order) {
+  BuddyBlock **cur = &ctx->free_lists[order];
+  while (*cur) {
+    if (*cur == block) {
+      *cur = block->next;
+      block->next = NULL;
+      return 1;
     }
-    curr = &(*curr)->next_free;
+    cur = &(*cur)->next;
   }
+  return 0;
+}
+static uint8_t order_from_size(size_t size) {
+  uint8_t order = MIN_ORDER;
+  while (order < MAX_ORDER - 1 && block_size(order) < size) {
+    ++order;
+  }
+  return order;
+}
+static inline void *align_up(void *ptr, size_t alignment) {
+  uintptr_t p = (uintptr_t)ptr;
+  return (void *)((p + alignment - 1ULL) & ~(uintptr_t)(alignment - 1ULL));
+}
+
+static uint8_t floor_order(size_t size) {
+  uint8_t order = MIN_ORDER;
+
+  while (order + 1 < MAX_ORDER && block_size((uint8_t)(order + 1)) <= size) {
+    ++order;
+  }
+
+  return order;
 }
 
 void *buddy_alloc_impl(IAllocator *self, size_t size) {
-  BuddyCtx *ctx = (BuddyCtx *)self->ctx;
-
-  if (!ctx->buffer || ctx->total_size == 0) {
+  BuddyCtx *ctx = self ? (BuddyCtx *)self->ctx : NULL;
+  if (!ctx || !ctx->base || size > SIZE_MAX - sizeof(BuddyBlock)) {
     return NULL;
   }
 
-  // Учитываем размер заголовка
-  if (size > SIZE_MAX - sizeof(BlockHeader)) {
-    return NULL;
+  size_t need = size + sizeof(BuddyBlock);
+  if (need < MIN_BLOCK) {
+    need = MIN_BLOCK;
   }
 
-  size_t actual_size = size + sizeof(BlockHeader);
-  uint8_t order = get_order(actual_size);
+  uint8_t order = order_from_size(need);
+
+  if (block_size(order) < need) {
+    return NULL;
+  }
 
   if (order > ctx->max_order) {
     return NULL;
   }
 
-  // Ищем свободный блок начиная с нужного порядка
-  uint8_t i = order;
-  while (i <= ctx->max_order && ctx->free_lists[i] == NULL) {
-    i++;
+  uint8_t current = order;
+  while (current <= ctx->max_order && ctx->free_lists[current] == NULL) {
+    ++current;
   }
 
-  if (i > ctx->max_order) {
-    return NULL; // Память кончилась
+  if (current > ctx->max_order) {
+    return NULL;
   }
 
-  // Извлекаем блок
-  BlockHeader *block = ctx->free_lists[i];
-  ctx->free_lists[i] = block->next_free;
-  block->next_free = NULL;
+  BuddyBlock *block = ctx->free_lists[current];
+  ctx->free_lists[current] = block->next;
 
-  // Расщепляем блоки (Splitting), если нашли блок большего размера
-  while (i > order) {
-    i--;
+  while (current > order) {
+    --current;
 
-    // Находим адрес напарника (половина текущего блока)
-    BlockHeader *buddy = (BlockHeader *)((uint8_t *)block + get_block_size(i));
-
-    // Добавляем напарника в список свободных уровнем ниже
-    buddy->order = i;
-    buddy->is_free = true;
-    buddy->next_free = ctx->free_lists[i];
-    ctx->free_lists[i] = buddy;
+    BuddyBlock *buddy = (BuddyBlock *)((uint8_t *)block + block_size(current));
+    buddy->order = current;
+    buddy->is_free = 1;
+    buddy->next = ctx->free_lists[current];
+    ctx->free_lists[current] = buddy;
   }
 
-  // Оформляем выделенный блок
   block->order = order;
-  block->is_free = false;
-  block->next_free = NULL;
+  block->is_free = 0;
+  block->next = NULL;
 
-  return (void *)(block + 1);
+  return (uint8_t *)block + sizeof(BuddyBlock);
 }
 
 void buddy_free_impl(IAllocator *self, void *ptr) {
-  if (!ptr) {
+  BuddyCtx *ctx = self ? (BuddyCtx *)self->ctx : NULL;
+  BuddyBlock *block = user_to_block(ctx, ptr);
+  if (!ctx || !block || block->is_free || block->order < MIN_ORDER ||
+      block->order > ctx->max_order) {
     return;
   }
 
-  BuddyCtx *ctx = (BuddyCtx *)self->ctx;
-  BlockHeader *hdr = (BlockHeader *)ptr - 1;
+  uintptr_t base = (uintptr_t)ctx->base;
+  uintptr_t current_addr = (uintptr_t)block;
+  uint8_t order = block->order;
 
-  // Защита от двойного освобождения
-  if (hdr->is_free) {
-    return;
-  }
-
-  uint8_t order = hdr->order;
-  void *curr_block = hdr;
-
-  // Пытаемся слить с напарниками (Coalescing)
   while (order < ctx->max_order) {
-    uintptr_t offset = (uintptr_t)curr_block - (uintptr_t)ctx->buffer;
-    uintptr_t buddy_offset = offset ^ get_block_size(order);
+    size_t size = block_size(order);
+    uintptr_t offset = current_addr - base;
+    uintptr_t buddy_offset = offset ^ size;
 
-    if (buddy_offset >= ctx->total_size) {
+    if (buddy_offset >= ctx->size) {
       break;
     }
 
-    BlockHeader *buddy = (BlockHeader *)((uint8_t *)ctx->buffer + buddy_offset);
+    BuddyBlock *buddy = (BuddyBlock *)(base + buddy_offset);
 
-    // Условия слияния: напарник свободен и имеет тот же порядок
+    if ((uintptr_t)buddy < base ||
+        (uintptr_t)buddy + sizeof(BuddyBlock) > base + ctx->size) {
+      break;
+    }
+
+    if (!buddy->is_free || buddy->order != order) {
+      break;
+    }
     if (!buddy->is_free || buddy->order != order) {
       break;
     }
 
-    // Вынимаем напарника из списка свободных
-    remove_from_list(ctx, buddy, order);
-
-    // Переходим на уровень выше (адрес нового блока — меньший из двух)
-    if (buddy_offset < offset) {
-      curr_block = buddy;
+    if (!remove_from_free_list(ctx, buddy, order)) {
+      break;
     }
 
-    order++;
+    if (buddy_offset < offset) {
+      current_addr = base + buddy_offset;
+    }
+
+    ++order;
   }
 
-  // Добавляем итоговый (возможно слитый) блок в список
-  BlockHeader *final_hdr = (BlockHeader *)curr_block;
-  final_hdr->order = order;
-  final_hdr->is_free = true;
-  final_hdr->next_free = ctx->free_lists[order];
-  ctx->free_lists[order] = final_hdr;
+  block = (BuddyBlock *)current_addr;
+  block->order = order;
+  block->is_free = 1;
+  block->next = ctx->free_lists[order];
+  ctx->free_lists[order] = block;
 }
 
 void *buddy_realloc_impl(IAllocator *self, void *ptr, size_t new_size) {
+  BuddyCtx *ctx = self ? (BuddyCtx *)self->ctx : NULL;
+
   if (!ptr) {
     return buddy_alloc_impl(self, new_size);
   }
@@ -181,30 +189,33 @@ void *buddy_realloc_impl(IAllocator *self, void *ptr, size_t new_size) {
     return NULL;
   }
 
-  BlockHeader *hdr = (BlockHeader *)ptr - 1;
-  size_t current_block_size = (1ULL << hdr->order) - sizeof(BlockHeader);
+  BuddyBlock *block = user_to_block(ctx, ptr);
+  if (!ctx || !block || block->is_free || block->order < MIN_ORDER ||
+      block->order > ctx->max_order) {
+    return NULL;
+  }
 
-  // Если новый размер влезает в текущий блок — оставляем как есть
-  if (new_size <= current_block_size) {
+  size_t current_payload = block_size(block->order) - sizeof(BuddyBlock);
+  if (new_size <= current_payload) {
     return ptr;
   }
 
-  // Иначе: аллокация -> копирование -> освобождение
   void *new_ptr = buddy_alloc_impl(self, new_size);
-  if (new_ptr) {
-    size_t copy_size =
-        (new_size < current_block_size) ? new_size : current_block_size;
-    memcpy(new_ptr, ptr, copy_size);
-    buddy_free_impl(self, ptr);
+  if (!new_ptr) {
+    return NULL;
   }
 
+  memcpy(new_ptr, ptr, current_payload);
+  buddy_free_impl(self, ptr);
   return new_ptr;
 }
 
 IAllocator create_buddy_alloc(BuddyCtx *ctx, void *memory, size_t memory_size) {
-  memset(ctx, 0, sizeof(*ctx));
+  if (ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+  }
 
-  if (!memory || memory_size < (1ULL << MIN_ORDER)) {
+  if (!ctx || !memory || memory_size < MIN_BLOCK) {
     return (IAllocator){.alloc = buddy_alloc_impl,
                         .free = buddy_free_impl,
                         .realloc = buddy_realloc_impl,
@@ -212,10 +223,8 @@ IAllocator create_buddy_alloc(BuddyCtx *ctx, void *memory, size_t memory_size) {
                         .ctx = ctx};
   }
 
-  // Выравниваем базу под указатель/максимальное выравнивание
-  void *aligned_memory = align_up_ptr(memory, alignof(max_align_t));
-  size_t offset = (size_t)((uint8_t *)aligned_memory - (uint8_t *)memory);
-
+  void *base = align_up(memory, alignof(max_align_t));
+  size_t offset = (size_t)((uint8_t *)base - (uint8_t *)memory);
   if (offset >= memory_size) {
     return (IAllocator){.alloc = buddy_alloc_impl,
                         .free = buddy_free_impl,
@@ -224,11 +233,8 @@ IAllocator create_buddy_alloc(BuddyCtx *ctx, void *memory, size_t memory_size) {
                         .ctx = ctx};
   }
 
-  size_t usable_size = memory_size - offset;
-  uint8_t max_order = get_max_order(usable_size);
-  size_t region_size = get_block_size(max_order);
-
-  if (region_size < (1ULL << MIN_ORDER)) {
+  size_t usable = memory_size - offset;
+  if (usable < MIN_BLOCK) {
     return (IAllocator){.alloc = buddy_alloc_impl,
                         .free = buddy_free_impl,
                         .realloc = buddy_realloc_impl,
@@ -236,21 +242,26 @@ IAllocator create_buddy_alloc(BuddyCtx *ctx, void *memory, size_t memory_size) {
                         .ctx = ctx};
   }
 
-  ctx->buffer = aligned_memory;
-  ctx->total_size = region_size;
-  ctx->max_order = max_order;
+  uint8_t max_order = floor_order(usable);
+  size_t region_size = block_size(max_order);
 
-  // Обнуляем списки
-  for (int i = 0; i < MAX_ORDERS; i++) {
-    ctx->free_lists[i] = NULL;
+  if (region_size < MIN_BLOCK || region_size > usable) {
+    return (IAllocator){.alloc = buddy_alloc_impl,
+                        .free = buddy_free_impl,
+                        .realloc = buddy_realloc_impl,
+                        .reset = stub_reset,
+                        .ctx = ctx};
   }
 
-  // Инициализируем первый большой блок
-  BlockHeader *first = (BlockHeader *)ctx->buffer;
-  first->order = ctx->max_order;
-  first->is_free = true;
-  first->next_free = NULL;
-  ctx->free_lists[ctx->max_order] = first;
+  ctx->base = base;
+  ctx->size = region_size;
+  ctx->max_order = max_order;
+
+  BuddyBlock *first = (BuddyBlock *)ctx->base;
+  first->order = max_order;
+  first->is_free = 1;
+  first->next = NULL;
+  ctx->free_lists[max_order] = first;
 
   return (IAllocator){.alloc = buddy_alloc_impl,
                       .free = buddy_free_impl,
