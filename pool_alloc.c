@@ -33,8 +33,8 @@ void *pool_alloc_impl(IAllocator *self, size_t size) {
 IAllocator create_pool_alloc(PoolCtx *ctx, void *memory, size_t memory_size,
                              size_t block_size) {
 
-  if (block_size<sizeof(Node)){
-    block_size=sizeof(Node);
+  if (block_size < sizeof(Node)) {
+    block_size = sizeof(Node);
   }
 
   ctx->buffer = memory;
