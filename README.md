@@ -1,4 +1,4 @@
 # ComputerScients
 Team: 
 1.Gutov Vsevolod (Dritious)
-2.Slobodchikov Egro (i-IDeSI-i)
+2.Slobodchikov Egor (i-IDeSI-i)
